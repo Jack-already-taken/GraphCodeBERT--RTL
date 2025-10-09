@@ -36,9 +36,16 @@ def test_model_architecture():
         def __init__(self, transformer):
             super().__init__()
             self.transformer = transformer
-            self.embeddings = nn.ModuleDict({
-                'word_embeddings': nn.Embedding(config.vocab_size, config.hidden_size)
-            })
+            # Create embeddings as a proper object with word_embeddings attribute
+            class Embeddings(nn.Module):
+                def __init__(self, vocab_size, hidden_size):
+                    super().__init__()
+                    self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
+                
+                def forward(self, input_ids):
+                    return self.word_embeddings(input_ids)
+            
+            self.embeddings = Embeddings(config.vocab_size, config.hidden_size)
             
         def forward(self, inputs_embeds, attention_mask=None, position_ids=None):
             # Simple mock forward - in real model this would be more complex

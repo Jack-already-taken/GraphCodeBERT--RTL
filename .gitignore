@@ -127,3 +127,23 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# 包含密码的临时脚本文件
+*.expect
+
+# 包含密码的部署脚本
+deploy_to_bridges2.sh
+
+# 包含密码的脚本和文档
+monitor_until_complete.sh
+monitor_training.sh
+BRIDGES2_DEPLOYMENT_GUIDE.md
+
+# 排除所有 shell 脚本
+*.sh
+
+# 排除训练好的模型（文件太大）
+saved_models/
+*.bin
+*.pth
+*.pt

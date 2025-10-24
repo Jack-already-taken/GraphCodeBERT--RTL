@@ -35,9 +35,11 @@ import random
 import logging
 import argparse
 import numpy as np
+import tempfile
 from io import open
 from itertools import cycle
 import torch.nn as nn
+from bleu import _bleu, compute_bleu
 from error_correction_model import RTLErrorCorrectionModel
 from tqdm import tqdm, trange
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
@@ -45,6 +47,31 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import (WEIGHTS_NAME, get_linear_schedule_with_warmup,
                           RobertaConfig, RobertaModel, RobertaTokenizer)
 from torch.optim import AdamW
+def _decode_preds_to_texts(preds, tokenizer):
+    texts = []
+    for pred in preds:
+        t = pred[0].cpu().numpy().tolist()
+        if 0 in t:
+            t = t[:t.index(0)]
+        texts.append(tokenizer.decode(t, clean_up_tokenization_spaces=False))
+    return texts
+
+def _predict_texts(model, dataloader, tokenizer, device, max_batches=None, desc="Eval"):
+    model.eval()
+    preds_all = []
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(dataloader, desc=desc)):
+            if max_batches is not None and i >= max_batches:
+                break
+            batch = tuple(t.to(device) for t in batch)
+            source_ids, source_mask, position_idx, attn_mask = batch
+            preds = model(source_ids=source_ids,
+                          source_mask=source_mask,
+                          position_idx=position_idx,
+                          attn_mask=attn_mask)
+            preds_all.extend(_decode_preds_to_texts(preds, tokenizer))
+    model.train()
+    return preds_all
 
 MODEL_CLASSES = {'roberta': (RobertaConfig, RobertaModel, RobertaTokenizer)}
 
@@ -209,6 +236,7 @@ def convert_examples_to_features(examples, tokenizer, args, stage="train"):
         
         # Truncate if too long
         if len(source_tokens) > args.max_source_length - 1:
+            print(f"Truncated source tokens for example {idx} to max length from {len(source_tokens)}")
             source_tokens = source_tokens[:args.max_source_length - 1]
         source_tokens = [tokenizer.cls_token] + source_tokens
         
@@ -247,6 +275,7 @@ def convert_examples_to_features(examples, tokenizer, args, stage="train"):
         if stage == "train" and correct_code:
             target_tokens = tokenizer.tokenize(correct_code)
             if len(target_tokens) > args.max_target_length - 2:
+                print(f"Truncated target tokens for example {idx} to max length from {len(target_tokens)}")
                 target_tokens = target_tokens[:args.max_target_length - 2]
             target_tokens = [tokenizer.cls_token] + target_tokens + [tokenizer.sep_token]
             target_ids = tokenizer.convert_tokens_to_ids(target_tokens)
@@ -305,6 +334,8 @@ def main():
                       help="Pretrained tokenizer name or path")
     parser.add_argument("--cache_dir", default="", type=str,
                       help="Where do you want to store the pre-trained models")
+    parser.add_argument("--load_model_path", default=None, type=str, 
+                        help="Path to trained model: Should contain the .bin files" ) 
     
     # Data arguments  
     parser.add_argument("--train_filename", default=None, type=str,
@@ -343,11 +374,15 @@ def main():
                       help="random seed for initialization")
     parser.add_argument("--beam_size", default=10, type=int,
                       help="beam size for beam search")
+    parser.add_argument("--eval_steps", type=int, default=None,
+                      help="If set, only evaluate this many batches during validation")
     
     args = parser.parse_args()
     
     # Setup CUDA, GPU & distributed training
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.n_gpu = torch.cuda.device_count()
+    # args.n_gpu = 1
     args.device = device
     
     # Set seed
@@ -372,6 +407,29 @@ def main():
         tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
                                                   cache_dir=args.cache_dir if args.cache_dir else None)
     
+    
+    # Load pre-trained encoder
+    encoder = model_class.from_pretrained(args.model_name_or_path, config=config,
+                                        cache_dir=args.cache_dir if args.cache_dir else None)
+    encoder.resize_token_embeddings(len(tokenizer))
+    
+    # Create decoder (transformer decoder)
+    decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
+    decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
+    
+    # Create our RTL error correction model
+    model = RTLErrorCorrectionModel(encoder, decoder, config, args.beam_size, 
+                                    args.max_target_length, tokenizer.cls_token_id, tokenizer.sep_token_id)
+    
+    if args.load_model_path is not None:
+        logger.info("reload model from {}".format(args.load_model_path))
+        model.load_state_dict(torch.load(args.load_model_path))
+    
+    model.to(device)
+    if args.n_gpu > 1:
+        # multi-gpu training
+        model = torch.nn.DataParallel(model)
+
     # Add special tokens for Verilog if needed (only during training)
     if args.do_train:
         special_tokens = ['<mask>', '<sep>', '<pad>', '<unk>']
@@ -390,6 +448,9 @@ def main():
         
         logger.info(f"Number of training examples: {len(train_examples)}")
         
+        # Setup progress tracking
+        epoch_progress = tqdm(total=int(args.num_train_epochs), desc="Training Progress", position=0)
+        
         # Convert to features (无需修改)
         train_features = convert_examples_to_features(train_examples, tokenizer, args, stage="train")
         
@@ -406,20 +467,6 @@ def main():
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
                                     batch_size=args.train_batch_size)
-        
-        # Load pre-trained encoder
-        encoder = model_class.from_pretrained(args.model_name_or_path, config=config,
-                                            cache_dir=args.cache_dir if args.cache_dir else None)
-        encoder.resize_token_embeddings(len(tokenizer))
-        
-        # Create decoder (transformer decoder)
-        decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
-        decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
-        
-        # Create our RTL error correction model
-        model = RTLErrorCorrectionModel(encoder, decoder, config, args.beam_size, 
-                                      args.max_target_length, tokenizer.cls_token_id, tokenizer.sep_token_id)
-        model.to(device)
         
         # Setup optimizer
         no_decay = ['bias', 'LayerNorm.weight']
@@ -440,27 +487,116 @@ def main():
         logger.info(f"  Batch size = {args.train_batch_size}")
         
         model.train()
-        tr_loss = 0.0
         global_step = 0
+        best_bleu = 0.0
+        
+        # Progress tracking
+        progress_desc = "Training Progress"
+        progress = tqdm(total=int(args.num_train_epochs), desc=progress_desc, position=0)
+        
+        # Load validation data if available
+        dev_examples = None
+        if args.dev_filename:
+            dev_examples = load_rtl_dataset(args.dev_filename)
+            progress.write(f"Loaded {len(dev_examples)} validation examples")
+            dev_features_for_bleu = convert_examples_to_features(dev_examples, tokenizer, args, stage='test')
+            dev_src_ids = torch.stack([f['source_ids'] for f in dev_features_for_bleu])
+            dev_src_mask = torch.stack([f['source_mask'] for f in dev_features_for_bleu])
+            dev_pos_idx  = torch.stack([f['position_idx'] for f in dev_features_for_bleu])
+            dev_attn     = torch.stack([f['attn_mask'] for f in dev_features_for_bleu])
+
+            dev_bleu_data = TensorDataset(dev_src_ids, dev_src_mask, dev_pos_idx, dev_attn)
+            dev_bleu_loader = DataLoader(
+                dev_bleu_data,
+                sampler=SequentialSampler(dev_bleu_data),
+                batch_size=args.eval_batch_size
+            )
         
         for epoch in range(int(args.num_train_epochs)):
-            for batch in tqdm(train_dataloader, desc=f"Epoch {epoch}"):
+            epoch_loss = 0
+            batch_progress = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{int(args.num_train_epochs)}", 
+                                position=1, leave=False)
+        
+            for batch in batch_progress:
                 source_ids, source_mask, position_idx, attn_mask, target_ids, target_mask = [x.to(device) for x in batch]
-                
+            
                 model.zero_grad()
                 loss = model(source_ids, source_mask, position_idx, attn_mask, target_ids, target_mask)[0]
+
+                if args.n_gpu > 1:
+                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
+                
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 
-                tr_loss += loss.item()
+                epoch_loss += loss.item()
                 global_step += 1
-                
-                if global_step % 100 == 0:
-                    logger.info(f"Epoch {epoch}, Step {global_step}, Loss: {loss.item():.4f}")
+                    
+                # Update progress bar
+                batch_progress.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'step': global_step,
+                    'lr': f"{scheduler.get_last_lr()[0]:.2e}"
+                })
+            
+            # Evaluate on validation set after each epoch
+            avg_loss = epoch_loss / len(train_dataloader)
+            logger.info(f"\nEpoch {epoch} completed. Average Loss: {avg_loss:.4f}")
+            
+            if dev_examples:
+
+                # Limit number of batches for BLEU on dev if args.eval_steps is set
+                max_batches = args.eval_steps if args.eval_steps is not None and args.eval_steps > 0 else None
+
+                preds = _predict_texts(
+                    model, dev_bleu_loader, tokenizer, device,
+                    max_batches=max_batches,
+                    desc=f"Dev BLEU (epoch {epoch})"
+                )
+
+                # Align references with predictions length (if truncated by eval_steps)
+                num_used = len(preds)
+                refs = [ex['correct_code'] for ex in dev_examples[:num_used]]
+
+                # Write files like run.py
+                os.makedirs(args.output_dir, exist_ok=True)
+                dev_out_path  = os.path.join(args.output_dir, "dev.output")
+                dev_gold_path = os.path.join(args.output_dir, "dev.gold")
+                with open(dev_out_path, "w", encoding="utf-8") as f_out, \
+                    open(dev_gold_path, "w", encoding="utf-8") as f_gold:
+                    for p, r in zip(preds, refs):
+                        f_out.write(p.strip() + "\n")
+                        f_gold.write(r.strip() + "\n")
+
+                # BLEU and xMatch like run.py
+                dev_bleu = round(_bleu(dev_gold_path, dev_out_path), 2)
+                xmatch   = round(np.mean([p.strip() == r.strip() for p, r in zip(preds, refs)]) * 100, 4)
+                logger.info("  bleu-4 = %s", str(dev_bleu))
+                logger.info("  xMatch = %s", str(xmatch))
+                logger.info("  " + "*" * 20)
+
+                # Track/best and save like run.py (BLEU+xMatch or BLEU only—your choice)
+                if dev_bleu > best_bleu:
+                    best_bleu = dev_bleu
+                    output_dir = os.path.join(args.output_dir, f'checkpoint-best-bleu')
+                    os.makedirs(output_dir, exist_ok=True)
+                    model_to_save = model.module if hasattr(model, 'module') else model
+                    torch.save(model_to_save.state_dict(), os.path.join(output_dir, 'pytorch_model.bin'))
+                    tokenizer.save_pretrained(output_dir)
+                    logger.info(f"Saved best dev BLEU checkpoint to {output_dir}")
+            
+            # Save checkpoint after each epoch
+            output_dir = os.path.join(args.output_dir, f'checkpoint-epoch-{epoch}')
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            model_to_save = model.module if hasattr(model, 'module') else model
+            torch.save(model_to_save.state_dict(), os.path.join(output_dir, 'pytorch_model.bin'))
+            tokenizer.save_pretrained(output_dir)
+            logger.info(f"Checkpoint saved to {output_dir}")
         
-        # Save model
+        # Save final model
         if not os.path.exists(args.output_dir):
             os.makedirs(args.output_dir)
         
@@ -473,111 +609,47 @@ def main():
         # ============================================================
         # 测试评估：加载模型并在测试集上预测
         # ============================================================
-        if args.test_filename:
-            logger.info(f"Loading test data from {args.test_filename}")
-            test_examples = load_rtl_dataset(args.test_filename)
-        else:
-            logger.info("No test_filename specified, using sample data")
-            test_examples = create_sample_data()
-        
-        logger.info(f"***** Running Test Evaluation *****")
-        logger.info(f"  Num test examples = {len(test_examples)}")
-        
-        # Convert to features
-        test_features = convert_examples_to_features(test_examples, tokenizer, args, stage='test')
-        
-        # Create dataset
-        all_source_ids = torch.stack([f['source_ids'] for f in test_features])
-        all_source_mask = torch.stack([f['source_mask'] for f in test_features])
-        all_position_idx = torch.stack([f['position_idx'] for f in test_features])
-        all_attn_mask = torch.stack([f['attn_mask'] for f in test_features])
-        
-        test_data = TensorDataset(all_source_ids, all_source_mask, all_position_idx, all_attn_mask)
-        test_sampler = SequentialSampler(test_data)
-        test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=args.eval_batch_size)
-        
-        # Initialize model if not already done (for --do_test only mode)
-        if 'model' not in locals():
-            logger.info("Initializing model for testing...")
-            config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-            
-            config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
-            encoder = model_class.from_pretrained(args.model_name_or_path, config=config)
-            
-            # Resize token embeddings to match the saved tokenizer
-            encoder.resize_token_embeddings(len(tokenizer))
-            
-            decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
-            decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
-            model = RTLErrorCorrectionModel(encoder=encoder, decoder=decoder, config=config,
-                                           beam_size=args.beam_size, max_length=args.max_target_length,
-                                           sos_id=tokenizer.cls_token_id, eos_id=tokenizer.sep_token_id)
-            model.to(device)
-        
-            # Load model weights
-            logger.info(f"Loading model from {args.output_dir}/pytorch_model.bin")
-            checkpoint = torch.load(os.path.join(args.output_dir, 'pytorch_model.bin'), map_location=device)
-            model.load_state_dict(checkpoint)  # Now size should match
-        
-        model.eval()
-        
-        predictions = []
-        logger.info("Generating predictions...")
-        
-        for batch in tqdm(test_dataloader, desc="Testing"):
-            batch = tuple(t.to(device) for t in batch)
-            source_ids, source_mask, position_idx, attn_mask = batch
-            
-            with torch.no_grad():
-                preds = model(source_ids=source_ids, 
-                            source_mask=source_mask,
-                            position_idx=position_idx, 
-                            attn_mask=attn_mask)
-                
-                # Decode predictions
-                for pred in preds:
-                    t = pred[0].cpu().numpy()
-                    t = list(t)
-                    if 0 in t:
-                        t = t[:t.index(0)]
-                    text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
-                    predictions.append(text)
-        
-        # Evaluate predictions
-        logger.info("\n***** Test Results *****")
-        correct = 0
-        for i, (example, pred) in enumerate(zip(test_examples, predictions)):
-            logger.info(f"\n--- Example {i+1} ---")
-            logger.info(f"Buggy Code:    {example['buggy_code']}")
-            logger.info(f"Expected Fix:  {example['correct_code']}")
-            logger.info(f"Predicted Fix: {pred}")
-            logger.info(f"Error Type:    {example.get('error_type', 'N/A')}")
-            
-            # Simple accuracy check (exact match)
-            if pred.strip() == example['correct_code'].strip():
-                logger.info(f"Status: ✅ CORRECT")
-                correct += 1
-            else:
-                logger.info(f"Status: ❌ INCORRECT")
-        
-        accuracy = correct / len(test_examples) * 100
-        logger.info(f"\n***** Test Summary *****")
-        logger.info(f"Total examples: {len(test_examples)}")
-        logger.info(f"Correct predictions: {correct}")
-        logger.info(f"Accuracy: {accuracy:.2f}%")
-        
-        # Save predictions
-        pred_file = os.path.join(args.output_dir, 'test_predictions.txt')
-        with open(pred_file, 'w') as f:
-            for i, (example, pred) in enumerate(zip(test_examples, predictions)):
-                f.write(f"Example {i+1}:\n")
-                f.write(f"Buggy: {example['buggy_code']}\n")
-                f.write(f"Expected: {example['correct_code']}\n")
-                f.write(f"Predicted: {pred}\n")
-                f.write(f"Error Type: {example.get('error_type', 'N/A')}\n")
-                f.write("-" * 80 + "\n")
-        
-        logger.info(f"Predictions saved to {pred_file}")
+        files = []
+        if args.dev_filename is not None:
+            files.append(("dev", args.dev_filename))
+        if args.test_filename is not None:
+            files.append(("test", args.test_filename))
+
+        for tag, path in files:
+            logger.info("Test file: %s", path)
+            eval_examples = load_rtl_dataset(path)  # your loader
+            eval_features = convert_examples_to_features(eval_examples, tokenizer, args, stage='test')
+
+            src_ids = torch.stack([f['source_ids'] for f in eval_features])
+            src_mask = torch.stack([f['source_mask'] for f in eval_features])
+            pos_idx  = torch.stack([f['position_idx'] for f in eval_features])
+            attn     = torch.stack([f['attn_mask'] for f in eval_features])
+
+            eval_data = TensorDataset(src_ids, src_mask, pos_idx, attn)
+            eval_loader = DataLoader(
+                eval_data,
+                sampler=SequentialSampler(eval_data),
+                batch_size=args.eval_batch_size
+            )
+
+            preds = _predict_texts(model, eval_loader, tokenizer, device, desc=f"Testing ({tag})")
+
+            refs = [ex['correct_code'] for ex in eval_examples]
+            # Write like run.py
+            out_path  = os.path.join(args.output_dir, f"{tag}.output")
+            gold_path = os.path.join(args.output_dir, f"{tag}.gold")
+            with open(out_path, "w", encoding="utf-8") as f_out, \
+                open(gold_path, "w", encoding="utf-8") as f_gold:
+                for p, r in zip(preds, refs):
+                    f_out.write(p.strip() + "\n")
+                    f_gold.write(r.strip() + "\n")
+
+            dev_bleu = round(_bleu(gold_path, out_path), 2)
+            xmatch   = round(np.mean([p.strip() == r.strip() for p, r in zip(preds, refs)]) * 100, 4)
+
+            logger.info("  bleu-4 = %s", str(dev_bleu))
+            logger.info("  xMatch = %s", str(xmatch))
+            logger.info("  " + "*" * 20)
 
 if __name__ == "__main__":
     main()
